@@ -1,0 +1,40 @@
+name: Zoner SEO + GEO audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "Page addresses separated by spaces (zoner.fi pages only, max 5)"
+        required: true
+        default: "https://www.zoner.fi/webhotellit/ https://www.zoner.fi/wordpress/ https://www.zoner.fi/ https://www.zoner.fi/domain"
+      provider:
+        description: "Which AI writes the proposals"
+        type: choice
+        default: gemini
+        options: [gemini, groq, openrouter]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests beautifulsoup4
+      - name: Run audit
+        env:
+          AI_PROVIDER: ${{ github.event.inputs.provider }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          URLS: ${{ github.event.inputs.urls }}
+        run: |
+          echo "$URLS" | tr ', ' '\n\n' > urls.txt
+          python zoner_audit.py urls.txt report.html
+      - name: Save report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zoner-audit-report
+          path: report.html
