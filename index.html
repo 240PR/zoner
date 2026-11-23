@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zoner SEO + GEO audit [Proto]</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --mute:#5b6570; --line:#dde1e6; --accent:#1f6feb; --ok:#1a7f37; --bad:#cf222e; --warn:#9a6700; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --card:#161b22; --ink:#e6edf3; --mute:#8b949e; --line:#30363d; --accent:#4493f8; --ok:#3fb950; --bad:#f85149; --warn:#d29922; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui,sans-serif; }
+  main { max-width:680px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  p.sub { color:var(--mute); margin:0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  label { display:block; font-weight:600; margin:12px 0 4px; }
+  label:first-child { margin-top:0; }
+  small { color:var(--mute); font-weight:400; }
+  textarea, input, select { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--ink); font:inherit; }
+  textarea { min-height:110px; font-family:ui-monospace,monospace; font-size:14px; }
+  button { margin-top:16px; padding:10px 18px; border:0; border-radius:6px; background:var(--accent); color:#fff; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  button.link { background:none; color:var(--accent); padding:0; margin:0; font-weight:400; text-decoration:underline; }
+  #status { margin-top:16px; padding:12px; border-radius:6px; border:1px solid var(--line); display:none; }
+  #status.ok { border-color:var(--ok); } #status.bad { border-color:var(--bad); } #status.wait { border-color:var(--warn); }
+  details { color:var(--mute); } summary { cursor:pointer; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Zoner SEO + GEO audit [Proto]</h1>
+  <p class="sub">Starts the audit - nothing is published.</p>
+
+  <div class="card">
+    <label for="urls">Pages to audit <small>(one per line or separated by spaces, zoner.fi only, max 5)</small></label>
+    <textarea id="urls">https://www.zoner.fi/webhotellit/
+https://www.zoner.fi/wordpress/
+https://www.zoner.fi/
+https://www.zoner.fi/domain</textarea>
+
+    <label for="provider">AI service</label>
+    <select id="provider">
+      <option value="gemini">Gemini (default)</option>
+      <option value="groq">Groq</option>
+      <option value="openrouter">OpenRouter</option>
+    </select>
+
+    <button id="run">Run audit</button>
+    <div id="status" role="status"></div>
+  </div>
+</main>
+
+<script>
+// Paste the GitHub token between the quotes below (fine-grained, Actions = Read and write, only this repo).
+const TOKEN = "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";
+const OWNER = "240PR", REPO = "zoner", WORKFLOW = "audit.yml", BRANCH = "main";
+const $ = id => document.getElementById(id);
+const status = $("status");
+
+function show(kind, html) {
+  status.className = kind; status.style.display = "block"; status.innerHTML = html;
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c])); }
+
+function explain(res, body) {
+  if (res.status === 401) return "GitHub rejected the token. It may have expired, been copied incompletely, or GitHub revoked it automatically because it was found in a public repository.";
+  if (res.status === 403) return "The token does not have permission. It needs Actions = Read and write on this repository.";
+  if (res.status === 404) return "GitHub cannot find the workflow. Check that the token covers 240PR/zoner and that audit.yml is in .github/workflows/.";
+  if (res.status === 422) return "GitHub did not accept the request: " + esc((body && body.message) || "unknown reason");
+  return "GitHub returned an error (code " + res.status + "). Try again in a minute.";
+}
+
+async function findRun(since, token) {
+  // The dispatch call returns no run id, so look for the newest run that started after the click.
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    const res = await fetch(`https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW}/runs?event=workflow_dispatch&per_page=5`,
+      { headers: { Authorization: "Bearer " + token, Accept: "application/vnd.github+json" } });
+    if (!res.ok) continue;
+    const d = await res.json();
+    const run = (d.workflow_runs || []).find(r => new Date(r.created_at).getTime() >= since - 5000);
+    if (run) return run;
+  }
+  return null;
+}
+
+async function poll(run, token) {
+  for (let i = 0; i < 120; i++) {
+    const res = await fetch(run.url, { headers: { Authorization: "Bearer " + token, Accept: "application/vnd.github+json" } });
+    if (res.ok) {
+      run = await res.json();
+      if (run.status === "completed") return run;
+      show("wait", `Audit is running (${esc(run.status)})... <a href="${run.html_url}" target="_blank" rel="noopener">Open on GitHub</a>`);
+    }
+    await new Promise(r => setTimeout(r, 5000));
+  }
+  return run;
+}
+
+$("run").addEventListener("click", async () => {
+  const token = TOKEN;
+  const urls = $("urls").value.split(/\s+/).filter(Boolean);
+  if (!token || token === "PASTE_TOKEN_HERE") return show("bad", "The GitHub token has not been added to the page code yet.");
+  if (!urls.length) return show("bad", "Add at least one page address.");
+  if (urls.length > 5) return show("bad", "Maximum is 5 pages. Remove some.");
+  if (urls.some(u => !/^https:\/\/(www\.)?zoner\.fi(\/|$)/.test(u))) return show("bad", "Only https://www.zoner.fi pages are allowed.");
+
+  $("run").disabled = true;
+  show("wait", "Starting the audit...");
+  const since = Date.now();
+  try {
+    const res = await fetch(`https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW}/dispatches`, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, Accept: "application/vnd.github+json", "Content-Type": "application/json" },
+      body: JSON.stringify({ ref: BRANCH, inputs: { urls: urls.join(" "), provider: $("provider").value } })
+    });
+    if (res.status !== 204) {
+      let body = null; try { body = await res.json(); } catch (e) {}
+      show("bad", explain(res, body));
+      return;
+    }
+    show("wait", "Audit started. Looking for the run on GitHub...");
+    let run = await findRun(since, token);
+    if (!run) return show("wait", `Audit was started, but the run was not found yet. <a href="https://github.com/${OWNER}/${REPO}/actions" target="_blank" rel="noopener">Open the Actions page</a>.`);
+    run = await poll(run, token);
+    const link = `<a href="${run.html_url}" target="_blank" rel="noopener">Open the result table on GitHub</a>`;
+    if (run.status === "completed" && run.conclusion === "success")
+      show("ok", `Done. ${link}. Warnings in the table mean the AI part failed for that page; the message says why.`);
+    else if (run.status === "completed")
+      show("bad", `The run failed (${esc(run.conclusion)}). ${link} and read the red message.`);
+    else
+      show("wait", `Still running. ${link}`);
+  } catch (e) {
+    show("bad", "Could not reach GitHub. Check the internet connection and try again.");
+  } finally {
+    $("run").disabled = false;
+  }
+});
+</script>
+</body>
+</html>
