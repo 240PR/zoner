@@ -1,0 +1,412 @@
+"""Zoner SEO + GEO audit prototype.
+
+Pipeline for each public page:
+  1. fetch   -> download the page (friendly errors if it fails)
+  2. audit   -> rule-based SEO and GEO checks (no AI, fully repeatable)
+  3. suggest -> Claude proposes better Finnish title, meta, H1, outline, FAQ
+  4. check   -> automatic safety checks on the proposal BEFORE a human sees it
+  5. report  -> one HTML file a marketer can read
+
+Nothing is ever published. The output is a proposal for a human to approve.
+"""
+import html
+import json
+import os
+import re
+import sys
+from urllib import robotparser
+from urllib.parse import urlparse
+
+import requests
+from bs4 import BeautifulSoup
+
+UA = "Mozilla/5.0 (compatible; ZonerAuditBot/1.0)"
+AI_BOTS = ["GPTBot", "OAI-SearchBot", "ClaudeBot", "PerplexityBot", "Google-Extended"]
+ALLOWED_HOSTS = {"zoner.fi", "www.zoner.fi"}
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+
+
+class FriendlyError(Exception):
+    """An error message written for a non-technical person."""
+
+
+# ---------------------------------------------------------------- 1. fetch
+def check_url(url):
+    url = url.strip()
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not p.netloc:
+        raise FriendlyError(f"'{url}' is not a full web address. It should start with https://")
+    if os.environ.get("ZONER_ALLOW_ANY") != "1" and p.netloc.lower() not in ALLOWED_HOSTS:
+        raise FriendlyError(f"'{url}' is not a zoner.fi page. This tool only audits public zoner.fi pages.")
+    return url
+
+
+def fetch(url):
+    url = check_url(url)
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=20)
+    except requests.exceptions.Timeout:
+        raise FriendlyError("The page took too long to answer. Try again in a minute.")
+    except requests.exceptions.ConnectionError:
+        raise FriendlyError("Could not reach the page. Check the address and your internet connection.")
+    except requests.exceptions.RequestException:
+        raise FriendlyError("Something went wrong while opening the page. Try again in a minute.")
+    if r.status_code == 404:
+        raise FriendlyError("This page does not exist (404). Check the address for typos.")
+    if r.status_code in (401, 403):
+        raise FriendlyError("The site refused the request (blocked). Wait a few minutes and try again, or tell the developer.")
+    if r.status_code >= 400:
+        raise FriendlyError(f"The site answered with an error (code {r.status_code}). Try again later.")
+    r.encoding = r.encoding or "utf-8"
+    return r.text
+
+
+def fetch_site_rules(url):
+    """robots.txt (are AI bots allowed?) and llms.txt (does it exist?)."""
+    p = urlparse(url)
+    base = f"{p.scheme}://{p.netloc}"
+    out = {"bots": {}, "llms_txt": None, "robots_found": False}
+    try:
+        r = requests.get(base + "/robots.txt", headers={"User-Agent": UA}, timeout=10)
+        if r.status_code == 200:
+            rp = robotparser.RobotFileParser()
+            rp.parse(r.text.splitlines())
+            out["robots_found"] = True
+            for bot in AI_BOTS:
+                out["bots"][bot] = rp.can_fetch(bot, url)
+    except requests.exceptions.RequestException:
+        pass
+    try:
+        r = requests.get(base + "/llms.txt", headers={"User-Agent": UA}, timeout=10)
+        out["llms_txt"] = r.status_code == 200
+    except requests.exceptions.RequestException:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------- 2. audit
+def page_text(soup):
+    s = BeautifulSoup(str(soup), "html.parser")
+    for t in s(["script", "style", "noscript"]):
+        t.decompose()
+    return re.sub(r"\s+", " ", s.get_text(" ")).strip()
+
+
+def schema_types(soup):
+    types = []
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+        except (ValueError, TypeError):
+            continue
+        stack = data if isinstance(data, list) else [data]
+        while stack:
+            d = stack.pop()
+            if isinstance(d, dict):
+                t = d.get("@type")
+                if isinstance(t, list):
+                    types += [str(x) for x in t]
+                elif t:
+                    types.append(str(t))
+                for v in d.values():
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(d, list):
+                stack.extend(d)
+    return sorted(set(types))
+
+
+def audit_page(html_text, url, site_rules=None):
+    soup = BeautifulSoup(html_text, "html.parser")
+    text = page_text(soup)
+    title = (soup.title.string or "").strip() if soup.title and soup.title.string else ""
+    md = soup.find("meta", attrs={"name": "description"})
+    meta = (md.get("content") or "").strip() if md else ""
+    h1s = [h.get_text(" ", strip=True) for h in soup.find_all("h1")]
+    h2s = [h.get_text(" ", strip=True) for h in soup.find_all("h2")]
+    imgs = soup.find_all("img")
+    no_alt = [i for i in imgs if not (i.get("alt") or "").strip()]
+    types = schema_types(soup)
+    canonical = soup.find("link", rel="canonical")
+    robots_meta = soup.find("meta", attrs={"name": "robots"})
+    noindex = bool(robots_meta and "noindex" in (robots_meta.get("content") or "").lower())
+    words = len(text.split())
+    question_heads = [h for h in h2s if h.rstrip().endswith("?")]
+
+    f = []  # findings: (level, area, message)  level: ok / warn / bad
+
+    def add(level, area, msg):
+        f.append({"level": level, "area": area, "msg": msg})
+
+    # SEO
+    if not title:
+        add("bad", "SEO", "No page title found.")
+    elif len(title) > 60:
+        add("warn", "SEO", f"Title is {len(title)} characters (aim for 60 or less): it may be cut off in Google.")
+    elif len(title) < 25:
+        add("warn", "SEO", f"Title is only {len(title)} characters: there is room to say more.")
+    else:
+        add("ok", "SEO", f"Title length is good ({len(title)} characters).")
+    if not meta:
+        add("bad", "SEO", "No meta description.")
+    elif len(meta) > 155:
+        add("warn", "SEO", f"Meta description is {len(meta)} characters (aim for 155 or less).")
+    elif len(meta) < 70:
+        add("warn", "SEO", f"Meta description is short ({len(meta)} characters).")
+    else:
+        add("ok", "SEO", f"Meta description length is good ({len(meta)} characters).")
+    if len(h1s) == 0:
+        add("bad", "SEO", "No H1 heading.")
+    elif len(h1s) > 1:
+        add("warn", "SEO", f"{len(h1s)} H1 headings found; there should be exactly one.")
+    else:
+        add("ok", "SEO", "Exactly one H1 heading.")
+    if len(h2s) < 2:
+        add("warn", "SEO", "Fewer than 2 H2 headings: the page structure is thin.")
+    if imgs and no_alt:
+        add("warn", "SEO", f"{len(no_alt)} of {len(imgs)} images have no alt text.")
+    if not canonical:
+        add("warn", "SEO", "No canonical link tag.")
+    if noindex:
+        add("bad", "SEO", "Page is set to 'noindex': Google will not list it.")
+    if soup.html and not soup.html.get("lang"):
+        add("warn", "SEO", "No language set on the page (html lang).")
+    if words < 150:
+        add("warn", "SEO", f"Only {words} words of text found. The page may load its content with JavaScript, "
+                           "which this tool cannot see. Treat the results with caution.")
+
+    # GEO
+    if types:
+        add("ok", "GEO", "Structured data found: " + ", ".join(types) + ".")
+    else:
+        add("warn", "GEO", "No structured data (schema.org). AI search engines understand the page less well.")
+    if "FAQPage" not in types and not question_heads:
+        add("warn", "GEO", "No FAQ or question-style headings. AI answers are often built from clear Q&A.")
+    p1 = soup.find("h1").find_next("p") if soup.find("h1") else None
+    if p1 is not None and len(p1.get_text(" ", strip=True).split()) > 60:
+        add("warn", "GEO", "The first paragraph after the H1 is long. A short direct answer (under 50 words) is easier to quote.")
+    if site_rules:
+        if site_rules["robots_found"]:
+            blocked = [b for b, ok in site_rules["bots"].items() if not ok]
+            if blocked:
+                add("bad", "GEO", "robots.txt blocks these AI crawlers: " + ", ".join(blocked) + ".")
+            else:
+                add("ok", "GEO", "robots.txt does not block the main AI crawlers.")
+        else:
+            add("warn", "GEO", "Could not read robots.txt, so AI crawler access is unknown.")
+        if site_rules["llms_txt"] is False:
+            add("warn", "GEO", "No llms.txt file (optional; support among AI tools is still unproven).")
+
+    return {
+        "url": url, "title": title, "meta": meta, "h1": h1s, "h2": h2s,
+        "words": words, "text": text, "schema": types, "findings": f,
+    }
+
+
+# --------------------------------------------------------------- 3. suggest
+PROMPT = """You are a Finnish SEO and GEO copywriter for Zoner, a Finnish web hosting company.
+Below is the text of one public page. Propose improvements in FINNISH.
+
+STRICT RULES
+- Use ONLY facts that appear in the page text. Never invent prices, discounts, features, numbers, guarantees or awards.
+- If a useful fact is missing from the page, do not guess. Add it to "missing_facts" instead.
+- Title: max 60 characters. Meta description: 110-155 characters. Natural, clear Finnish.
+- FAQ: 3 questions real customers would ask, answered in 1-2 sentences, from the page text only.
+
+Return ONLY valid JSON, no other text, with this shape:
+{{"title": "...", "meta_description": "...", "h1": "...",
+  "outline": ["H2 heading", "..."],
+  "faq": [{{"q": "...", "a": "..."}}],
+  "missing_facts": ["..."]}}
+
+PAGE URL: {url}
+CURRENT TITLE: {title}
+CURRENT META: {meta}
+PAGE TEXT:
+{text}
+"""
+
+
+def suggest(page):
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise FriendlyError("No Claude API key is set. Ask the developer to add it (see the instructions, step 1).")
+    prompt = PROMPT.format(url=page["url"], title=page["title"], meta=page["meta"], text=page["text"][:6000])
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": MODEL, "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}]},
+            timeout=90,
+        )
+    except requests.exceptions.RequestException:
+        raise FriendlyError("Could not reach Claude. Check your internet connection and try again.")
+    if r.status_code in (401, 403):
+        raise FriendlyError("Claude rejected the API key. Ask the developer to check it.")
+    if r.status_code == 429:
+        raise FriendlyError("Claude is busy or the usage limit was reached. Wait a minute and try again.")
+    if r.status_code >= 400:
+        raise FriendlyError(f"Claude returned an error (code {r.status_code}). Try again in a minute.")
+    raw = "".join(b.get("text", "") for b in r.json().get("content", []))
+    raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise FriendlyError("Claude's answer was not in the expected format. Press the button again; if it repeats, tell the developer.")
+
+
+# ----------------------------------------------------------------- 4. check
+FI_WORDS = set("ja on ei että se mutta tai kuin sinä sinun voit yritys yrityksen jos kun myös ovat oli mitä miten sivusto sivuston verkkotunnus tilaa kanssa sekä tämä nämä joka".split())
+EN_WORDS = set("the and is are you your for with that this from have will can how what which our of to in".split())
+# word stems, so that inflected forms (ilmaisen, parhaat, takuun) are caught too
+CLAIMS = ["paras", "parha", "nopein", "halvin", "edullisin", "takuu", "100 %", "100%", "ilmai", "ykkö", "markkinajohta"]
+NUM = re.compile(r"\d+(?:[.,]\d+)?")
+
+
+def _nums(s):
+    return {n.replace(",", ".") for n in NUM.findall(s)}
+
+
+def check_suggestion(page, s):
+    """Automatic checks. Returns list of {level, msg}; level: pass / review / fail."""
+    out = []
+    title = (s.get("title") or "").strip()
+    meta = (s.get("meta_description") or "").strip()
+    h1 = (s.get("h1") or "").strip()
+    faq = s.get("faq") or []
+    outline = s.get("outline") or []
+    prop = " ".join([title, meta, h1, *outline, *[f"{x.get('q','')} {x.get('a','')}" for x in faq]])
+    src = (page["text"] + " " + page["title"] + " " + page["meta"]).lower()
+
+    def add(level, msg):
+        out.append({"level": level, "msg": msg})
+
+    add("pass" if 0 < len(title) <= 60 else "fail", f"Title length {len(title)} (limit 60).")
+    add("pass" if 70 <= len(meta) <= 155 else "fail", f"Meta description length {len(meta)} (limit 70-155).")
+    add("pass" if h1 else "fail", "H1 present." if h1 else "H1 missing.")
+    add("pass" if len(faq) >= 2 else "review", f"{len(faq)} FAQ items proposed.")
+
+    toks = re.findall(r"[a-zåäö]+", prop.lower())
+    fi, en = sum(t in FI_WORDS for t in toks), sum(t in EN_WORDS for t in toks)
+    if en > fi and en >= 3:
+        add("fail", "The proposal looks like English, not Finnish.")
+    elif len(toks) >= 25 and fi == 0:
+        add("review", "Could not confirm the text is Finnish. Read it carefully.")
+    else:
+        add("pass", "Language looks Finnish.")
+
+    # Invented facts: numbers
+    money = set(re.findall(r"(\d+(?:[.,]\d+)?)\s*(?:€|eur|euro|%|prosent)", prop.lower()))
+    bad_money = {n.replace(",", ".") for n in money} - _nums(src)
+    if bad_money:
+        add("fail", "Price or percentage NOT found on the original page: " + ", ".join(sorted(bad_money)) + ". Probably invented.")
+    other = _nums(prop) - _nums(src) - bad_money
+    if other:
+        add("review", "Numbers not found on the original page: " + ", ".join(sorted(other)) + ". Check them.")
+    if not bad_money and not other:
+        add("pass", "All numbers in the proposal exist on the original page.")
+
+    # Invented claims
+    claims = [c for c in CLAIMS if c in prop.lower() and c not in src]
+    if claims:
+        add("fail", "Claims not made on the original page: " + ", ".join(claims) + ".")
+    else:
+        add("pass", "No new superlatives or guarantees.")
+
+    if s.get("missing_facts"):
+        add("review", "Claude says these facts are missing from the page: " + "; ".join(s["missing_facts"]))
+    return out
+
+
+def verdict(checks):
+    levels = {c["level"] for c in checks}
+    return "FAIL" if "fail" in levels else "REVIEW" if "review" in levels else "PASS"
+
+
+# ---------------------------------------------------------------- 5. report
+ICON = {"ok": "✅", "warn": "⚠️", "bad": "❌", "pass": "✅", "review": "👀", "fail": "❌"}
+
+
+def run_url(url, site_cache=None):
+    """Full pipeline for one URL. Never raises: errors become a friendly message."""
+    try:
+        h = fetch(url)
+        base = urlparse(url).netloc
+        if site_cache is not None and base in site_cache:
+            rules = site_cache[base]
+        else:
+            rules = fetch_site_rules(url)
+            if site_cache is not None:
+                site_cache[base] = rules
+        page = audit_page(h, url, rules)
+    except FriendlyError as e:
+        return {"url": url, "error": str(e)}
+    res = {"url": url, "page": page}
+    try:
+        res["suggestion"] = suggest(page)
+        res["checks"] = check_suggestion(page, res["suggestion"])
+        res["verdict"] = verdict(res["checks"])
+    except FriendlyError as e:
+        res["suggest_error"] = str(e)
+    return res
+
+
+def to_html(results):
+    e = html.escape
+    parts = ["<!doctype html><meta charset='utf-8'><title>Zoner audit</title>"
+             "<style>body{font-family:system-ui,sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem;line-height:1.5}"
+             "h2{border-top:2px solid #ddd;padding-top:1rem}.box{background:#f6f6f6;padding:.6rem 1rem;border-radius:6px}"
+             ".err{background:#fde8e8;padding:.6rem 1rem;border-radius:6px}</style>"
+             "<h1>Zoner SEO + GEO audit</h1><p><b>These are proposals only. Nothing has been published.</b></p>"]
+    for r in results:
+        parts.append(f"<h2>{e(r['url'])}</h2>")
+        if "error" in r:
+            parts.append(f"<p class='err'>❌ {e(r['error'])}</p>")
+            continue
+        p = r["page"]
+        parts.append(f"<p>Current title: <i>{e(p['title'] or '-')}</i><br>Current meta: <i>{e(p['meta'] or '-')}</i></p><h3>Audit</h3><ul>")
+        for x in p["findings"]:
+            parts.append(f"<li>{ICON[x['level']]} <b>{x['area']}</b>: {e(x['msg'])}</li>")
+        parts.append("</ul>")
+        if "suggest_error" in r:
+            parts.append(f"<p class='err'>❌ Proposal not created: {e(r['suggest_error'])}</p>")
+            continue
+        s = r["suggestion"]
+        parts.append(f"<h3>Proposal (Finnish) - automatic check: {r['verdict']}</h3><div class='box'>"
+                     f"<p><b>Title:</b> {e(s.get('title',''))}<br><b>Meta:</b> {e(s.get('meta_description',''))}<br>"
+                     f"<b>H1:</b> {e(s.get('h1',''))}</p><b>Suggested H2 structure:</b><ol>"
+                     + "".join(f"<li>{e(o)}</li>" for o in s.get("outline", [])) + "</ol><b>FAQ:</b><ul>"
+                     + "".join(f"<li><b>{e(x.get('q',''))}</b><br>{e(x.get('a',''))}</li>" for x in s.get("faq", []))
+                     + "</ul></div><h3>Automatic checks</h3><ul>"
+                     + "".join(f"<li>{ICON[c['level']]} {e(c['msg'])}</li>" for c in r["checks"]) + "</ul>"
+                     "<p><i>A person must read this before anything is used. PASS means the automatic checks found nothing, not that the text is good.</i></p>")
+    return "".join(parts)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python zoner_audit.py urls.txt [report.html]")
+        sys.exit(1)
+    urls = [u.strip() for u in open(sys.argv[1], encoding="utf-8") if u.strip() and not u.startswith("#")]
+    cache = {}
+    results = []
+    for u in urls:
+        print("Checking", u)
+        results.append(run_url(u, cache))
+    out = sys.argv[2] if len(sys.argv) > 2 else "report.html"
+    open(out, "w", encoding="utf-8").write(to_html(results))
+    print("Done. Open", out)
+    summ = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summ:  # short result table on the GitHub run page
+        lines = ["## Zoner audit", "", "| Page | Result |", "|---|---|"]
+        for r in results:
+            if "error" in r:
+                res = "❌ " + r["error"]
+            elif "suggest_error" in r:
+                res = "⚠️ Proposal not created: " + r["suggest_error"]
+            else:
+                res = r["verdict"]
+            lines.append(f"| {r['url']} | {res.replace('|', '/')} |")
+        lines.append("")
+        lines.append("Download the full report from **Artifacts** at the bottom of this page.")
+        open(summ, "a", encoding="utf-8").write("\n".join(lines) + "\n")

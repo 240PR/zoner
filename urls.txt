@@ -1,0 +1,2 @@
+# Put 1-5 public zoner.fi page addresses here, one per line (for the command line version)
+https://zoner.fi/
