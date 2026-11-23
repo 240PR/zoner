@@ -7,6 +7,11 @@ on:
         description: "Page addresses separated by spaces (zoner.fi pages only, max 5)"
         required: true
         default: "https://www.zoner.fi/webhotellit/ https://www.zoner.fi/wordpress/ https://www.zoner.fi/ https://www.zoner.fi/domain"
+      provider:
+        description: "Which AI writes the proposals"
+        type: choice
+        default: gemini
+        options: [gemini, groq, openrouter]
 
 jobs:
   audit:
@@ -19,7 +24,10 @@ jobs:
       - run: pip install requests beautifulsoup4
       - name: Run audit
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_PROVIDER: ${{ github.event.inputs.provider }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           URLS: ${{ github.event.inputs.urls }}
         run: |
           echo "$URLS" | tr ', ' '\n\n' > urls.txt
