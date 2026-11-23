@@ -230,7 +230,7 @@ PAGE TEXT:
 PROVIDERS = {
     # name: (key variable, default model)  - change the model with AI_MODEL if a name is retired
     "gemini": ("GEMINI_API_KEY", "gemini-2.5-flash"),
-    "groq": ("GROQ_API_KEY", "llama-3.3-70b-versatile"),
+    "groq": ("GROQ_API_KEY", "openai/gpt-oss-120b"),  # llama-3.3-70b-versatile was shut down by Groq on 2026-08-16
     "anthropic": ("ANTHROPIC_API_KEY", MODEL),
 }
 OPENAI_STYLE = {"groq": "https://api.groq.com/openai/v1/chat/completions"}
