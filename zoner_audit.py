@@ -231,11 +231,9 @@ PROVIDERS = {
     # name: (key variable, default model)  - change the model with AI_MODEL if a name is retired
     "gemini": ("GEMINI_API_KEY", "gemini-2.5-flash"),
     "groq": ("GROQ_API_KEY", "llama-3.3-70b-versatile"),
-    "openrouter": ("OPENROUTER_API_KEY", "meta-llama/llama-3.3-70b-instruct:free"),
     "anthropic": ("ANTHROPIC_API_KEY", MODEL),
 }
-OPENAI_STYLE = {"groq": "https://api.groq.com/openai/v1/chat/completions",
-                "openrouter": "https://openrouter.ai/api/v1/chat/completions"}
+OPENAI_STYLE = {"groq": "https://api.groq.com/openai/v1/chat/completions"}
 
 
 def list_gemini_models(key):
@@ -327,7 +325,7 @@ def call_ai(provider, key, model, prompt):
 def suggest(page):
     provider = os.environ.get("AI_PROVIDER", "gemini").lower()
     if provider not in PROVIDERS:
-        raise FriendlyError(f"Unknown AI provider '{provider}'. Choose gemini, groq, openrouter or anthropic.")
+        raise FriendlyError(f"Unknown AI provider '{provider}'. Choose gemini, groq or anthropic.")
     keyvar, default_model = PROVIDERS[provider]
     key = os.environ.get(keyvar)
     if not key:
@@ -442,9 +440,10 @@ def run_url(url, site_cache=None):
 def to_html(results):
     e = html.escape
     parts = ["<!doctype html><meta charset='utf-8'><title>Zoner audit</title>"
-             "<style>body{font-family:system-ui,sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem;line-height:1.5}"
-             "h2{border-top:2px solid #ddd;padding-top:1rem}.box{background:#f6f6f6;padding:.6rem 1rem;border-radius:6px}"
-             ".err{background:#fde8e8;padding:.6rem 1rem;border-radius:6px}</style>"
+             "<style>body{background:#000;color:#fff;font-family:Arial,Helvetica,sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem;line-height:1.5}"
+             "h1,h3{color:#fff}h2{border-top:1px solid #555;padding-top:1rem;color:#68FFD6}i{color:#bbb}"
+             ".box{background:#111;border:1px solid #333;padding:.6rem 1rem;border-radius:6px}"
+             ".err{background:#2a0f0f;border:1px solid #7a2a2a;padding:.6rem 1rem;border-radius:6px}</style>"
              "<h1>Zoner SEO + GEO audit</h1><p><b>These are proposals only. Nothing has been published.</b></p>"]
     for r in results:
         parts.append(f"<h2>{e(r['url'])}</h2>")
