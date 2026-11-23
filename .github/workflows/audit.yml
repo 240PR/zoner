@@ -11,7 +11,7 @@ on:
         description: "Which AI writes the proposals"
         type: choice
         default: gemini
-        options: [gemini, groq, openrouter]
+        options: [gemini, groq]
 
 permissions:
   contents: write
@@ -30,7 +30,6 @@ jobs:
           AI_PROVIDER: ${{ github.event.inputs.provider }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           URLS: ${{ github.event.inputs.urls }}
         run: |
           echo "$URLS" | tr ', ' '\n\n' > urls.txt
