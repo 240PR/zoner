@@ -257,7 +257,7 @@ def pick_gemini_model(key):
     return "gemini-2.5-flash"
 
 
-def call_ai(provider, key, model, prompt):
+def _call_ai_once(provider, key, model, prompt):
     """Return the AI's raw text answer. Raises FriendlyError on any problem."""
     try:
         if provider == "gemini":
@@ -279,7 +279,7 @@ def call_ai(provider, key, model, prompt):
                 json={"model": model, "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}]},
                 timeout=90)
     except requests.exceptions.RequestException:
-        raise FriendlyError("Could not reach the AI service. Check the internet connection and try again.")
+        raise FriendlyError(f"Could not reach the AI service (model {model}). Check the internet connection and try again.")
     if r.status_code in (400, 404):
         try:
             detail = r.json().get("error", {}).get("message", "")[:300]
@@ -291,7 +291,7 @@ def call_ai(provider, key, model, prompt):
     if r.status_code == 429:
         raise FriendlyError("The free usage limit was reached or the service is busy. Wait a minute and try again.")
     if r.status_code >= 400:
-        raise FriendlyError(f"The AI service returned an error (code {r.status_code}). Try again in a minute.")
+        raise FriendlyError(f"The AI service returned an error (code {r.status_code}, model {model}). Try again in a minute.")
     try:
         d = r.json()
         if provider == "gemini":
@@ -301,6 +301,27 @@ def call_ai(provider, key, model, prompt):
         return "".join(b.get("text", "") for b in d.get("content", []))
     except (ValueError, KeyError, IndexError, TypeError):
         raise FriendlyError("The AI answered in an unexpected way (it may have blocked the request). Press the button again.")
+
+
+def call_ai(provider, key, model, prompt):
+    """Try the model; if the service is busy (5xx / no answer) wait and retry, then try a fallback model."""
+    import time
+    models = [model]
+    if provider == "gemini":
+        models += [m for m in ("gemini-2.5-flash", "gemini-2.0-flash") if m != model]
+    last = None
+    for m in models:
+        for attempt in range(3):
+            try:
+                return _call_ai_once(provider, key, m, prompt)
+            except FriendlyError as e:
+                last = e
+                msg = str(e)
+                busy = "(code 5" in msg or "Could not reach" in msg or "code 429" in msg or "free usage limit" in msg
+                if not busy:
+                    raise
+                time.sleep(5 * (attempt + 1))
+    raise last
 
 
 def suggest(page):
