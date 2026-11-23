@@ -238,8 +238,8 @@ OPENAI_STYLE = {"groq": "https://api.groq.com/openai/v1/chat/completions",
                 "openrouter": "https://openrouter.ai/api/v1/chat/completions"}
 
 
-def pick_gemini_model(key):
-    """Ask Google which models exist and pick the newest stable 'gemini-X-flash'."""
+def list_gemini_models(key):
+    """Ask Google which models this key can use. Newest stable 'gemini-X-flash' first, then '-flash-lite'."""
     try:
         r = requests.get("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
                          headers={"x-goog-api-key": key}, timeout=30)
@@ -247,14 +247,12 @@ def pick_gemini_model(key):
         names = []
         for m in r.json().get("models", []):
             n = m.get("name", "").replace("models/", "")
-            if "generateContent" in m.get("supportedGenerationMethods", []) and re.fullmatch(r"gemini-\d+(?:\.\d+)?-flash", n):
+            if "generateContent" in m.get("supportedGenerationMethods", []) and re.fullmatch(r"gemini-\d+(?:\.\d+)?-flash(?:-lite)?", n):
                 names.append(n)
-        if names:
-            names.sort(key=lambda n: [float(x) for x in re.findall(r"\d+(?:\.\d+)?", n)], reverse=True)
-            return names[0]
+        names.sort(key=lambda n: ([float(x) for x in re.findall(r"\d+(?:\.\d+)?", n)], not n.endswith("-lite")), reverse=True)
+        return names
     except (requests.exceptions.RequestException, ValueError):
-        pass
-    return "gemini-2.5-flash"
+        return []
 
 
 def _call_ai_once(provider, key, model, prompt):
@@ -304,24 +302,26 @@ def _call_ai_once(provider, key, model, prompt):
 
 
 def call_ai(provider, key, model, prompt):
-    """Try the model; if the service is busy (5xx / no answer) wait and retry, then try a fallback model."""
+    """Try the model. If the service is busy, wait and retry. For Gemini, then try the next model Google lists."""
     import time
     models = [model]
-    if provider == "gemini":
-        models += [m for m in ("gemini-2.5-flash", "gemini-2.0-flash") if m != model]
-    last = None
+    if provider == "gemini" and not os.environ.get("AI_MODEL"):
+        models = list_gemini_models(key)[:3] or [model]
+    first_error = None
     for m in models:
         for attempt in range(3):
             try:
                 return _call_ai_once(provider, key, m, prompt)
             except FriendlyError as e:
-                last = e
+                first_error = first_error or e
                 msg = str(e)
                 busy = "(code 5" in msg or "Could not reach" in msg or "code 429" in msg or "free usage limit" in msg
                 if not busy:
+                    if "code 404" in msg and len(models) > 1:
+                        break  # this model is gone, try the next one
                     raise
                 time.sleep(5 * (attempt + 1))
-    raise last
+    raise first_error
 
 
 def suggest(page):
@@ -332,7 +332,7 @@ def suggest(page):
     key = os.environ.get(keyvar)
     if not key:
         raise FriendlyError(f"No API key is set for {provider} ({keyvar}). Ask the developer to add it.")
-    model = os.environ.get("AI_MODEL") or (pick_gemini_model(key) if provider == "gemini" else default_model)
+    model = os.environ.get("AI_MODEL") or default_model
     prompt = PROMPT.format(url=page["url"], title=page["title"], meta=page["meta"], text=page["text"][:6000])
     raw = call_ai(provider, key, model, prompt)
     raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
