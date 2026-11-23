@@ -346,11 +346,11 @@ FI_WORDS = set("ja on ei että se mutta tai kuin sinä sinun voit yritys yrityks
 EN_WORDS = set("the and is are you your for with that this from have will can how what which our of to in".split())
 # word stems, so that inflected forms (ilmaisen, parhaat, takuun) are caught too
 CLAIMS = ["paras", "parha", "nopein", "halvin", "edullisin", "takuu", "100 %", "100%", "ilmai", "ykkö", "markkinajohta"]
-NUM = re.compile(r"\d+(?:[.,]\d+)?")
+NUM = re.compile(r"\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?:,\d+)?|\d+(?:[.,]\d+)?")
 
 
 def _nums(s):
-    return {n.replace(",", ".") for n in NUM.findall(s)}
+    return {re.sub(r"[ \u00a0\u202f]", "", n).replace(",", ".") for n in NUM.findall(s)}
 
 
 def check_suggestion(page, s):
