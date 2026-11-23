@@ -3,7 +3,7 @@
 Pipeline for each public page:
   1. fetch   -> download the page (friendly errors if it fails)
   2. audit   -> rule-based SEO and GEO checks (no AI, fully repeatable)
-  3. suggest -> Claude proposes better Finnish title, meta, H1, outline, FAQ
+  3. suggest -> an AI model proposes better Finnish title, meta, H1, outline, FAQ
   4. check   -> automatic safety checks on the proposal BEFORE a human sees it
   5. report  -> one HTML file a marketer can read
 
@@ -227,32 +227,76 @@ PAGE TEXT:
 """
 
 
-def suggest(page):
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        raise FriendlyError("No Claude API key is set. Ask the developer to add it (see the instructions, step 1).")
-    prompt = PROMPT.format(url=page["url"], title=page["title"], meta=page["meta"], text=page["text"][:6000])
+PROVIDERS = {
+    # name: (key variable, default model)  - change the model with AI_MODEL if a name is retired
+    "gemini": ("GEMINI_API_KEY", "gemini-2.5-flash"),
+    "groq": ("GROQ_API_KEY", "llama-3.3-70b-versatile"),
+    "openrouter": ("OPENROUTER_API_KEY", "meta-llama/llama-3.3-70b-instruct:free"),
+    "anthropic": ("ANTHROPIC_API_KEY", MODEL),
+}
+OPENAI_STYLE = {"groq": "https://api.groq.com/openai/v1/chat/completions",
+                "openrouter": "https://openrouter.ai/api/v1/chat/completions"}
+
+
+def call_ai(provider, key, model, prompt):
+    """Return the AI's raw text answer. Raises FriendlyError on any problem."""
     try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": MODEL, "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}]},
-            timeout=90,
-        )
+        if provider == "gemini":
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                headers={"x-goog-api-key": key, "content-type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"responseMimeType": "application/json"}},
+                timeout=90)
+        elif provider in OPENAI_STYLE:
+            r = requests.post(OPENAI_STYLE[provider],
+                              headers={"Authorization": "Bearer " + key},
+                              json={"model": model, "messages": [{"role": "user", "content": prompt}]},
+                              timeout=90)
+        else:
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": model, "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}]},
+                timeout=90)
     except requests.exceptions.RequestException:
-        raise FriendlyError("Could not reach Claude. Check your internet connection and try again.")
+        raise FriendlyError("Could not reach the AI service. Check the internet connection and try again.")
+    if r.status_code in (400, 404):
+        raise FriendlyError(f"The AI service did not accept the request (code {r.status_code}). The model name may have changed: tell the developer.")
     if r.status_code in (401, 403):
-        raise FriendlyError("Claude rejected the API key. Ask the developer to check it.")
+        raise FriendlyError("The AI service rejected the API key. Ask the developer to check it.")
     if r.status_code == 429:
-        raise FriendlyError("Claude is busy or the usage limit was reached. Wait a minute and try again.")
+        raise FriendlyError("The free usage limit was reached or the service is busy. Wait a minute and try again.")
     if r.status_code >= 400:
-        raise FriendlyError(f"Claude returned an error (code {r.status_code}). Try again in a minute.")
-    raw = "".join(b.get("text", "") for b in r.json().get("content", []))
-    raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
+        raise FriendlyError(f"The AI service returned an error (code {r.status_code}). Try again in a minute.")
     try:
-        return json.loads(raw)
+        d = r.json()
+        if provider == "gemini":
+            return "".join(p.get("text", "") for p in d["candidates"][0]["content"]["parts"])
+        if provider in OPENAI_STYLE:
+            return d["choices"][0]["message"]["content"]
+        return "".join(b.get("text", "") for b in d.get("content", []))
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise FriendlyError("The AI answered in an unexpected way (it may have blocked the request). Press the button again.")
+
+
+def suggest(page):
+    provider = os.environ.get("AI_PROVIDER", "gemini").lower()
+    if provider not in PROVIDERS:
+        raise FriendlyError(f"Unknown AI provider '{provider}'. Choose gemini, groq, openrouter or anthropic.")
+    keyvar, default_model = PROVIDERS[provider]
+    key = os.environ.get(keyvar)
+    if not key:
+        raise FriendlyError(f"No API key is set for {provider} ({keyvar}). Ask the developer to add it.")
+    model = os.environ.get("AI_MODEL") or default_model
+    prompt = PROMPT.format(url=page["url"], title=page["title"], meta=page["meta"], text=page["text"][:6000])
+    raw = call_ai(provider, key, model, prompt)
+    raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
+    i, j = raw.find("{"), raw.rfind("}")
+    try:
+        return json.loads(raw[i:j + 1])
     except ValueError:
-        raise FriendlyError("Claude's answer was not in the expected format. Press the button again; if it repeats, tell the developer.")
+        raise FriendlyError("The AI's answer was not in the expected format. Press the button again; if it repeats, tell the developer.")
 
 
 # ----------------------------------------------------------------- 4. check
