@@ -238,6 +238,25 @@ OPENAI_STYLE = {"groq": "https://api.groq.com/openai/v1/chat/completions",
                 "openrouter": "https://openrouter.ai/api/v1/chat/completions"}
 
 
+def pick_gemini_model(key):
+    """Ask Google which models exist and pick the newest stable 'gemini-X-flash'."""
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+                         headers={"x-goog-api-key": key}, timeout=30)
+        r.raise_for_status()
+        names = []
+        for m in r.json().get("models", []):
+            n = m.get("name", "").replace("models/", "")
+            if "generateContent" in m.get("supportedGenerationMethods", []) and re.fullmatch(r"gemini-\d+(?:\.\d+)?-flash", n):
+                names.append(n)
+        if names:
+            names.sort(key=lambda n: [float(x) for x in re.findall(r"\d+(?:\.\d+)?", n)], reverse=True)
+            return names[0]
+    except (requests.exceptions.RequestException, ValueError):
+        pass
+    return "gemini-2.5-flash"
+
+
 def call_ai(provider, key, model, prompt):
     """Return the AI's raw text answer. Raises FriendlyError on any problem."""
     try:
@@ -262,7 +281,11 @@ def call_ai(provider, key, model, prompt):
     except requests.exceptions.RequestException:
         raise FriendlyError("Could not reach the AI service. Check the internet connection and try again.")
     if r.status_code in (400, 404):
-        raise FriendlyError(f"The AI service did not accept the request (code {r.status_code}). The model name may have changed: tell the developer.")
+        try:
+            detail = r.json().get("error", {}).get("message", "")[:300]
+        except ValueError:
+            detail = r.text[:300]
+        raise FriendlyError(f"The AI service did not accept the request (code {r.status_code}, model {model}). Details: {detail}")
     if r.status_code in (401, 403):
         raise FriendlyError("The AI service rejected the API key. Ask the developer to check it.")
     if r.status_code == 429:
@@ -288,7 +311,7 @@ def suggest(page):
     key = os.environ.get(keyvar)
     if not key:
         raise FriendlyError(f"No API key is set for {provider} ({keyvar}). Ask the developer to add it.")
-    model = os.environ.get("AI_MODEL") or default_model
+    model = os.environ.get("AI_MODEL") or (pick_gemini_model(key) if provider == "gemini" else default_model)
     prompt = PROMPT.format(url=page["url"], title=page["title"], meta=page["meta"], text=page["text"][:6000])
     raw = call_ai(provider, key, model, prompt)
     raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
