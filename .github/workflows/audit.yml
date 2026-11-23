@@ -1,4 +1,4 @@
-name: Zoner SEO + GEO audit
+name: Zoner SEO + GEO audit [Proto]
 
 on:
   workflow_dispatch:
